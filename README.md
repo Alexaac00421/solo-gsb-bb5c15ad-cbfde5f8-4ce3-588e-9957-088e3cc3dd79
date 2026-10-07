@@ -501,6 +501,108 @@ curl -X POST http://localhost:8000/api/schedule \
 }
 ```
 
+### 发布评审：单项服务延迟容忍度（本轮新增）
+
+发布评审需要知道**现有排程对每个单项服务延迟的容忍度**时，调用
+`POST /api/schedule/tolerance`。系统先按现有规则求出**基线排程**（与 `/api/schedule`
+首项完全一致；请求里的 `alternative_count` / `min_gap_minutes` 被忽略，容忍度始终
+基于首项基线），再对每个**未锁定**服务做逐分钟延迟分析。
+
+请求体：
+
+```json
+{
+  "request": { "...一份完整的 /api/schedule 请求体..." },
+  "max_delay_minutes": 120
+}
+```
+
+- `request`：现有排程请求，**规则与 `/api/schedule` 请求体完全一致**（候选窗、依赖、
+  团队禁发、冻结、资源分时容量、锁定与参考时刻等全部沿用）。
+- `max_delay_minutes`：延迟上限（**正整数分钟**，非正整数按 422 拒绝）。
+
+对每个**未锁定**服务，保持**其他服务的基线开始时刻不变**，把该服务的部署开始时刻
+从基线起逐分钟（整分钟）向后推迟，判定每个分钟点是否仍满足**全部既有约束**
+（候选窗、依赖、团队禁发、维护冻结、共享资源分时容量；延迟后的**部署及回滚占用**
+均按原规则判断），并给出：
+
+- `max_feasible_delay_minutes`：从 **0 分钟起连续**仍可行的最大延迟（含 0，即“完全不推迟”），
+  不超过上限；
+- `first_failure_minutes`：上限内**首个失效分钟**；上限内均可行时为 `null`；
+- `blockers`：首个失效分钟触发的约束组合（code/message 与 `/api/schedule` 的阻塞核同源）。
+
+判定的是**连续性**：一旦在分钟 d 失效就立即报告 d，**不会**因为更晚的时刻重新可行
+（如穿过一段冻结 / 禁发 / 限流时段之后）而越过中间的失效分钟。
+**锁定服务**（`pinned_starts`）标为 `"deferrable": false`，不参与分析，
+三个容忍度字段为 `null`。
+
+响应（200）：
+
+```json
+{
+  "feasible": true,
+  "status": "optimal",
+  "schedule": [ "…基线排程（与 /api/schedule 首项一致）…" ],
+  "blockers": null,
+  "max_delay_minutes": 120,
+  "tolerance": [
+    {"service_id": "a", "name": "服务 A", "deferrable": true,
+     "max_feasible_delay_minutes": 30,
+     "first_failure_minutes": 31,
+     "blockers": [{"code": "freeze:封网:a", "message": "…期间服务 A 不得部署或处于回滚窗口内"}],
+     "status": "ok"},
+    {"service_id": "payments", "name": "支付服务", "deferrable": false,
+     "max_feasible_delay_minutes": null,
+     "first_failure_minutes": null, "blockers": null, "status": "ok"}
+  ]
+}
+```
+
+规则细节：
+
+- **基线无解**：返回 **200、`feasible=false`、`status: "infeasible"`** 与原有 `blockers`
+  阻塞组合，`tolerance` 为 `null`——不输出容忍度，也不返回部分排程；
+  **基线求解未定**（超时，`status: "unknown"`）同样返回原有未定状态、不输出容忍度。
+- **输入非法**沿用现有 422 格式（内层 `request` 的 DST / 坏时区 / 依赖环 / 区间非法 /
+  资源容量非法等，以及 `max_delay_minutes` 非正整数）。
+- 首个失效分钟的 `blockers` 是该固定时刻方案的 **sufficient-assumption 阻塞核**，
+  与 `/api/schedule` 无解时同一套 code（如 `window:<服务>:<缺口开始>`、`freeze:<标签>:<服务>`、
+  `blackout:<团队>:<服务>:<开始>`、`dependency:<上游>-><下游>`、`resource:<资源>`、
+  `resource:<资源>:<时段开始>`）。
+- 分钟点可行性用与 CP-SAT 同构的整数秒解析判定快速扫描，并在 0 分钟、首个失效分钟
+  及其前一分钟（全可行时再加上限分钟）用 CP-SAT 固定时刻模型复核、直接从复核求解取阻塞核；
+  任一复核点与解析判定不一致即自动回退为 0..上限**逐分钟 CP-SAT 精确探测**，
+  因此即使上限很大（如数千分钟）也很快，且结果与求解器严格一致。
+
+调用示例（curl）：
+
+```bash
+curl -X POST http://localhost:8000/api/schedule/tolerance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request": {
+      "services": [
+        {"id":"a","name":"服务 A","timezone":"UTC",
+         "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+         "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]},
+        {"id":"b","name":"服务 B","timezone":"UTC",
+         "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+         "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]}
+      ],
+      "freezes": [
+        {"label":"封网","start":"2026-12-01T03:00:00Z","end":"2026-12-01T04:00:00Z","timezone":"UTC"}
+      ]
+    },
+    "max_delay_minutes": 120
+  }'
+```
+
+上例基线 `a` 00:00 / `b` 01:00（容量 1 的 `db` 串行）：`a` 推迟 1 分钟即撞上固定在
+01:00 的 `b`（`max_feasible_delay_minutes: 0`、`first_failure_minutes: 1`、
+`blockers: [resource:db]`）；`b` 在冻结前可推迟到 02:00 开始（部署 02:00~03:00
+恰好左闭右开不进冻结），故 `max_feasible_delay_minutes: 60`、首个失效分钟 61
+（`freeze:封网:b`）——尽管 04:00 之后又重新可行，连续判定仍停在 61，不会跳过。
+
 ### `POST /api/schedule/diff` — 变更影响预演
 
 变更评审时，提交一份**当前排程请求**和一份**修改后的请求**，系统分别独立求解，
@@ -636,11 +738,12 @@ curl -X POST http://localhost:8000/api/schedule/diff \
 
 ```
 app/
-  main.py        FastAPI 入口（/api/schedule、/api/schedule/diff、/api/health、静态页面）
+  main.py        FastAPI 入口（/api/schedule、/api/schedule/tolerance、/api/schedule/diff、/api/health、静态页面）
   models.py      请求/响应 Pydantic 模型
   times.py       时区解析与 DST 重复/不存在分类（zoneinfo fold 规则）
   validator.py   输入校验：DST、引用完整性、依赖环检测、区间合法性
   scheduler.py   CP-SAT 建模、求解、不可行假设核（blocking core）提取
+  tolerance.py   单项延迟容忍度：逐分钟可行性解析判定 + CP-SAT 复核/阻塞核（不一致回退逐分钟探测）
   diff.py        变更影响预演：双请求执行与按服务 ID 的时刻对齐求差
   web/index.html 操作页面（原生 JS，内置 3 个示例场景）
 Dockerfile

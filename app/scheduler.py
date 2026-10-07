@@ -160,10 +160,14 @@ def _add_segment_capacity(m: cp_model.CpModel, starts, services, users: list[str
     m.add_cumulative(clamped, [1] * len(clamped), cap)
 
 
-def _build_model(norm: Normalized) -> _ModelCtx:
+def _build_model(norm: Normalized, h1_override: int | None = None) -> _ModelCtx:
     """按全部约束建模（候选窗/冻结/禁发/资源分时容量/依赖/锁定），并准备目标表达式。
 
     备选方案的每一项都用同一建模独立求解，保证每项都满足全部既有约束。
+
+    h1_override 用于单项延迟容忍度探测：把建模轴右端延伸到更晚时刻（仅向右扩展，
+    使被探测服务被等式固定在基线之后较远的时刻时，窗口缺口等假设仍能解释不可行，
+    而不是因起点越界产生“无关于任何假设”的不可行）。常规求解不传该参数。
     """
     m = cp_model.CpModel()
     services = norm.services
@@ -179,6 +183,8 @@ def _build_model(norm: Normalized) -> _ModelCtx:
     H1 = h1
     for sid, pst in norm.pinned_starts.items():
         H1 = max(H1, pst + services[sid].duration + services[sid].rollback)
+    if h1_override is not None:
+        H1 = max(H1, h1_override)
 
     # 假设字面量 index -> (code, message)，用于不可行核解释。
     assumption_map: dict[int, tuple[str, str]] = {}
@@ -489,21 +495,36 @@ def _add_diversity_constraints(ctx: _ModelCtx, prev_plans: list[dict[str, int]],
         m.add_bool_or(lits)
 
 
-def solve(norm: Normalized) -> SolveResult:
-    deadline = time.monotonic() + norm.max_solve_seconds
-
-    # ---- 首项：与既有行为完全一致（含 infeasible 阻塞核 / unknown 不输出排程） ----
+def _solve_baseline(norm: Normalized, deadline: float) -> SolveResult:
+    """首项求解：与既有行为完全一致（含 infeasible 阻塞核 / unknown 不输出排程）。"""
     ctx = _build_model(norm)
     status, starts, solver = _optimize(ctx, deadline)
     if status == "infeasible":
         return _infeasible_result(ctx, solver)
     if status == "unknown":
         return _unknown_result(layered=bool(norm.reference_starts))
+    return SolveResult(True, status, starts, None)
+
+
+def solve_baseline(norm: Normalized) -> SolveResult:
+    """只求基线（首项）排程，供延迟容忍度等复用；行为与 /api/schedule 首项一致。"""
+    deadline = time.monotonic() + norm.max_solve_seconds
+    return _solve_baseline(norm, deadline)
+
+
+def solve(norm: Normalized) -> SolveResult:
+    deadline = time.monotonic() + norm.max_solve_seconds
+
+    # ---- 首项：与既有行为完全一致（含 infeasible 阻塞核 / unknown 不输出排程） ----
+    first = _solve_baseline(norm, deadline)
+    if not first.feasible:
+        return first
+    starts = first.starts
 
     # 未启用备选方案：原样返回，响应与旧版本一致。
     count = norm.alternative_count
     if count is None:
-        return SolveResult(True, status, starts, None)
+        return first
 
     # ---- 备选方案：逐项独立建模求解，每项都满足全部约束并与此前各项拉开最小差距 ----
     plans: list[dict[str, int]] = [starts]
@@ -532,6 +553,6 @@ def solve(norm: Normalized) -> SolveResult:
             break
 
     return SolveResult(
-        True, status, starts, None,
+        True, first.status, starts, None,
         plans=plans, alternatives_status=alt_status,
     )

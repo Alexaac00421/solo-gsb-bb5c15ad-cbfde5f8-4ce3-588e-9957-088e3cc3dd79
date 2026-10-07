@@ -18,9 +18,14 @@ from .models import (
     ScheduleItem,
     ScheduleRequest,
     ScheduleResponse,
+    ScheduleToleranceRequest,
+    ScheduleToleranceResponse,
+    ServiceTolerance,
 )
 from .diff import build_diff, run_request
+from .scheduler import solve_baseline
 from .times import to_local_display
+from .tolerance import analyze_tolerance
 
 app = FastAPI(
     title="跨时区发布窗口编排",
@@ -135,6 +140,75 @@ def schedule_diff(body: ScheduleDiffRequest):
 
 def _iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+@app.post("/api/schedule/tolerance", response_model=ScheduleToleranceResponse)
+def schedule_tolerance(body: ScheduleToleranceRequest):
+    """发布评审：现有排程对每个未锁定服务单项延迟的容忍度。
+
+    先按现有规则求基线（与 /api/schedule 首项完全一致）；基线无解（infeasible，
+    含阻塞组合）或求解未定（unknown）时沿用原有输出、不输出容忍度；输入非法沿用
+    现有 422 格式。基线可行时对每个未锁定服务，保持其他服务基线开始时刻不变，
+    逐分钟推迟该服务（上限为 max_delay_minutes），给出从 0 起连续可行的最大延迟、
+    上限内首个失效分钟及触发的约束；锁定服务标为不可推迟。
+    """
+    req = body.request
+
+    if not req.services:
+        return ScheduleToleranceResponse(
+            feasible=False, status="infeasible",
+            blockers=[BlockingConstraint(code="empty_services",
+                                         message="至少需要一个服务")],
+        )
+
+    # 只做输入校验：容忍度始终基于首项基线，故直接求基线一次
+    # （忽略请求中的 alternative_count / min_gap_minutes，避免额外求解备选方案）。
+    from .validator import validate_and_normalize
+    norm, validation_errors = validate_and_normalize(req)
+    if validation_errors:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422,
+                            content={"errors": validation_errors})
+
+    # 基线按原规则求解：无解（含阻塞核）或未定（unknown）均沿用原有输出，不输出容忍度。
+    result = solve_baseline(norm)
+    if not result.feasible:
+        return ScheduleToleranceResponse(
+            feasible=False,
+            status=result.status,
+            blockers=[BlockingConstraint(**b) for b in (result.blockers or [])],
+        )
+
+    assert result.starts is not None
+    base = result.starts
+
+    def build_plan(starts: dict[str, int]) -> list[ScheduleItem]:
+        return [_build_item(norm, sid, st)
+                for sid, st in sorted(starts.items(), key=lambda kv: (kv[1], kv[0]))]
+
+    raw = analyze_tolerance(norm, base, body.max_delay_minutes,
+                            norm.max_solve_seconds)
+    tolerance = [
+        ServiceTolerance(
+            service_id=tr.service_id,
+            name=norm.services[tr.service_id].name,
+            deferrable=tr.deferrable,
+            max_feasible_delay_minutes=tr.max_feasible_delay_minutes,
+            first_failure_minutes=tr.first_failure_minutes,
+            blockers=([BlockingConstraint(**b) for b in tr.blockers]
+                      if tr.blockers is not None else None),
+            status=tr.status,
+        )
+        for tr in raw
+    ]
+
+    return ScheduleToleranceResponse(
+        feasible=True,
+        status=result.status,
+        schedule=build_plan(base),
+        max_delay_minutes=body.max_delay_minutes,
+        tolerance=tolerance,
+    )
 
 
 @app.get("/")

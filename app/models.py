@@ -204,3 +204,39 @@ class ScheduleDiffResponse(BaseModel):
     diff: ScheduleDiff | None = None
     failures: dict[str, RequestFailure] | None = Field(
         None, description="任一请求输入错误或无解时，按 current/modified 给出对应错误，不输出差异")
+
+
+# ---- 发布评审：单项服务延迟容忍度（/api/schedule/tolerance） ----
+
+
+class ScheduleToleranceRequest(BaseModel):
+    request: ScheduleRequest = Field(..., description="现有排程请求（与 /api/schedule 请求体规则完全一致）")
+    max_delay_minutes: int = Field(
+        ..., ge=1,
+        description="延迟上限（正整数分钟）：逐分钟判定 0..该上限；最大容忍延迟不超过该值")
+
+
+class ServiceTolerance(BaseModel):
+    service_id: str
+    name: str
+    deferrable: bool = Field(..., description="false=已锁定服务（pinned_starts），不可推迟，不参与分析")
+    max_feasible_delay_minutes: int | None = Field(
+        None, description="从 0 分钟起连续仍满足全部约束的最大延迟（分钟，含 0）；锁定服务为 null")
+    first_failure_minutes: int | None = Field(
+        None, description="上限内首个失效分钟；上限内全部可行或服务锁定时为 null")
+    blockers: list[BlockingConstraint] | None = Field(
+        None, description="首个失效分钟触发的约束组合；全可行/锁定时为 null")
+    status: str = Field(
+        "ok", description="ok=判定完成；unknown=探测超时未能判定（按不可越过处理，blockers 说明原因）")
+
+
+class ScheduleToleranceResponse(BaseModel):
+    feasible: bool = Field(..., description="基线可行为 true；基线无解/未定时为 false，不输出容忍度")
+    status: str = Field(..., description="基线状态 optimal | feasible | infeasible | unknown")
+    schedule: list[ScheduleItem] | None = Field(None, description="基线排程（与 /api/schedule 首项一致）")
+    blockers: list[BlockingConstraint] | None = Field(
+        None, description="基线无解时的阻塞约束组合（沿用原输出）")
+    max_delay_minutes: int | None = Field(None, description="本次分析生效的延迟上限（分钟）")
+    tolerance: list[ServiceTolerance] | None = Field(
+        None, description="逐服务容忍度结果；基线无解/未定时为 null")
+
